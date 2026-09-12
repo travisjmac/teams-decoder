@@ -234,6 +234,9 @@ class GlobalMetadata:
                 db_name = buff.read(db_name_length * 2).decode("utf-16-be")
 
             db_id_no = le_varint_from_bytes(dbid_rec.value)
+            if db_id_no is None:
+                # Malformed/stale record (e.g. tombstoned db id with an empty value); skip it.
+                continue
 
             dbids.append(DatabaseId(db_id_no, origin, db_name))
 

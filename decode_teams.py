@@ -52,7 +52,7 @@ def run():
     if not os.path.isdir(outdir):
         os.mkdir(outdir)
 
-    with open(sys.argv[1], 'r') as data_file:
+    with open(args.json, 'r', encoding='utf-8') as data_file:
         json_data = data_file.read()
 
     data = json.loads(json_data)
@@ -92,12 +92,15 @@ def run():
 
             # Also grab display names from "lastMessage". Mostly needed to get own name
             if "lastMessage" in item["value"] and type(item["value"]["lastMessage"]) is dict:
-                who = item["value"]["lastMessage"]["from"]
-                if who.startswith("worker/"):
-                    who = who[7:]
-                if item["value"]["lastMessage"]["imdisplayname"] != "":
+                last_msg = item["value"]["lastMessage"]
+                who = last_msg.get("from")
+                if who is not None:
+                    if who.startswith("worker/"):
+                        who = who[7:]
+                    imdisplayname = last_msg.get("imdisplayname")
+                    if imdisplayname:
     #                print("who:",who,item["value"]["lastMessage"]["imdisplayname"])
-                    mids[who] = item["value"]["lastMessage"]["imdisplayname"]
+                        mids[who] = imdisplayname
 
             # Keep info around for later
             conversations[cid] = item["value"]
@@ -177,13 +180,25 @@ def run():
         fname = typ+"_"+fname
         fname = fname.replace(" ", "_")
         fname = fname.replace('/', '')
+        # Sanitize characters that are invalid in Windows filenames (and
+        # awkward elsewhere), e.g. ':' from "8:orgid:..." ids.
+        for bad_char in '<>:"\\|?*':
+            fname = fname.replace(bad_char, '')
+        # Keep filenames well within filesystem limits (large group chats can
+        # produce very long comma-separated member lists).
+        if len(fname) > 150:
+            fname = fname[:150] + "_" + str(abs(hash(conv)) % 100000)
 
         if os.path.isfile(os.path.join(outdir, fname)):
-            raise FileExistsError(fname)
+            # Two different conversation ids can legitimately share the same
+            # topic/title (e.g. recurring meeting series, or duplicate
+            # conversation records recovered from an orphaned database).
+            # Disambiguate instead of aborting the whole extraction.
+            fname = fname + "_" + str(abs(hash(conv)) % 100000)
 
         # Write whole conversation to file
         padding = 0
-        with open(os.path.join(outdir, fname), 'w') as cfile:
+        with open(os.path.join(outdir, fname), 'w', encoding='utf-8') as cfile:
             # Add header to file
             print(f"Id: {conv}[{typ}]", file=cfile)
 
@@ -254,8 +269,11 @@ def run():
                             if len(ppl) > 0:
                                 txt = end+"Parted: "+",".join(ppl)
                         except Exception:
-                            print("xml_exc:", txt)
-                            raise
+                            # Some call event XML payloads have multiple root
+                            # elements or otherwise don't parse cleanly. Fall
+                            # back to the raw (semi-)XML text instead of
+                            # aborting the whole extraction.
+                            txt = end+txt
                     print(tm, f"{mt}", "--", txt, file=cfile)
                 elif typ == "Conversation":
                     tm = time.gmtime(msg["originalArrivalTime"]/1000)
@@ -281,25 +299,26 @@ def run():
 
                         name = rname(log["originatorParticipant"],
                                      "displayName", "id")
-                        if log["targetParticipant"] is not None:
-                            tname = rname(log["targetParticipant"],
-                                          "displayName", "id")
+                        target = log.get("targetParticipant")
+                        if target is not None:
+                            tname = rname(target, "displayName", "id")
                             txt = f"call to {tname}"
                         else:
                             txt = "called"
 
-                        ps = log["participants"]
+                        ps = log.get("participants")
                         if ps is not None:
                             if log["originatorParticipant"]["id"] in ps:
                                 ps.remove(log["originatorParticipant"]["id"])
-                            if log["targetParticipant"] is not None:
-                                if log["targetParticipant"]["id"] in ps:
-                                    ps.remove(log["targetParticipant"]["id"])
+                            if target is not None:
+                                if target["id"] in ps:
+                                    ps.remove(target["id"])
 
                             if len(ps) > 0:
                                 txt += " + " + ",".join([resolve(x) for x in ps])
 
-                        txt += " - End: "+log["endTime"]
+                        if log.get("endTime"):
+                            txt += " - End: "+log["endTime"]
 
                     print(tm, f"{mt}", f"<{name}>", txt, file=cfile)
                 else:

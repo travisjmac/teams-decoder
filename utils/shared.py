@@ -43,6 +43,27 @@ Additionally, it has a flag to filter for datastores, which are interesting for 
 """
 
 
+def classify_record_shape(value):
+    """Classify a decoded IndexedDB record by the shape of its content, so that
+    "orphaned" data (belonging to a database instance no longer referenced by
+    current metadata) can still be recognised and processed by decode_teams.py,
+    which dispatches purely on the 'store' name.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    if 'messageMap' in value and isinstance(value.get('messageMap'), dict):
+        return 'replychains'
+
+    if 'members' in value and isinstance(value.get('members'), list) and 'type' in value:
+        return 'conversations'
+
+    if 'buddies' in value or ('id' in value and 'nameHint' in value and 'displayName' in str(value.get('nameHint'))):
+        return 'buddylist'
+
+    return None
+
+
 class FastIndexedDB:
     def __init__(self, leveldb_dir: os.PathLike):
         self._db = ccl_leveldb.RawLevelDb(leveldb_dir)
@@ -118,6 +139,10 @@ class FastIndexedDB:
     def iterate_records(self, do_not_filter=False):
 
         blink_deserializer = ccl_blink_value_deserializer.BlinkV8Deserializer()
+        # Track which (dbid_no, object_store_id) pairs we've handled here, so
+        # iterate_records_content_based() can skip them and only pick up
+        # "orphaned" databases that current metadata no longer references.
+        self.known_store_keys = set()
         # Loop through the databases and object stores based on their ids
         for global_id in self.global_metadata.db_ids:
             # print(f"Processing database: {global_id.name}")
@@ -126,6 +151,7 @@ class FastIndexedDB:
 
                 datastore = self.object_store_meta.get_meta(global_id.dbid_no, object_store_id,
                                                             ObjectStoreMetadataType.StoreName)
+                self.known_store_keys.add((global_id.dbid_no, object_store_id))
 
                 # print(f"\t Processing object store: {datastore}")
                 records_per_object_store = 0
@@ -150,6 +176,13 @@ class FastIndexedDB:
 
                             val_idx += len(varint_raw)
 
+                            # Blink envelope versions >= 21 reserve space for a trailer (used for
+                            # WebAssembly module transfer, etc.) right after the version number:
+                            # a 0xFE tag, an 8-byte LE trailer offset and a 4-byte LE trailer size.
+                            # Skip over it so we land on the real V8 envelope (0xFF <version>).
+                            if blink_version >= 21 and val_idx < len(record.value) and record.value[val_idx] == 0xfe:
+                                val_idx += 1 + 8 + 4
+
                             # read the raw value of the record.
                             obj_raw = io.BytesIO(record.value[val_idx:])
                             try:
@@ -165,6 +198,67 @@ class FastIndexedDB:
                                 continue
                 # print(f"{datastore} {global_id.name} {records_per_object_store}")
 
+    def iterate_records_content_based(self, known_keys=None):
+        """Fallback scan for "orphaned" data: records that belong to a database
+        instance which is no longer referenced by the current global metadata
+        (e.g. because Teams recreated/renumbered its internal databases after a
+        cache reset or re-login). We can't look up an object-store name for
+        these via metadata, so instead we decode every raw data record we can
+        and classify it by the *shape* of its decoded content.
+
+        known_keys: an optional set of (dbid_no, object_store_id) tuples that
+        were already handled by iterate_records(), so we don't yield duplicates.
+        """
+        if known_keys is None:
+            known_keys = set()
+
+        blink_deserializer = ccl_blink_value_deserializer.BlinkV8Deserializer()
+
+        for record in self._fetched_records:
+            if record.state != ccl_leveldb.KeyState.Live:
+                continue
+            key = record.key
+            # Data records look like: 0x00, dbid_no, object_store_id, 0x01, <idb key...>
+            if len(key) < 4 or key[0] != 0 or key[3] != 1:
+                continue
+            dbid_no = key[1]
+            object_store_id = key[2]
+            if (dbid_no, object_store_id) in known_keys:
+                continue
+            if record.value == b'':
+                continue
+
+            try:
+                value_version, varint_raw = ccl_chromium_indexeddb.custom_le_varint_from_bytes(record.value)
+                val_idx = len(varint_raw)
+                blink_type_tag = record.value[val_idx]
+                if blink_type_tag != 0xff:
+                    continue
+                val_idx += 1
+
+                blink_version, varint_raw = ccl_chromium_indexeddb.custom_le_varint_from_bytes(
+                    record.value[val_idx:])
+                val_idx += len(varint_raw)
+
+                if blink_version >= 21 and val_idx < len(record.value) and record.value[val_idx] == 0xfe:
+                    val_idx += 1 + 8 + 4
+
+                obj_raw = io.BytesIO(record.value[val_idx:])
+                deserializer = ccl_v8_value_deserializer.Deserializer(
+                    obj_raw, host_object_delegate=blink_deserializer.read)
+                value = deserializer.read()
+            except Exception:
+                continue
+
+            datastore = classify_record_shape(value)
+            if datastore is None:
+                continue
+
+            newkey = IdbKey(record.key[4:])
+            yield {'key': newkey, 'value': value, 'origin_file': record.origin_file,
+                   'store': datastore, 'state': record.state, 'seq': record.seq,
+                   'orphaned_dbid': dbid_no}
+
 
 def parse_db(filepath, do_not_filter=False):
     # Open raw access to a LevelDB and deserialize the records.
@@ -172,6 +266,16 @@ def parse_db(filepath, do_not_filter=False):
     extracted_values = []
     for record in db.iterate_records(do_not_filter):
         extracted_values.append(record)
+
+    # Also recover data from "orphaned" databases: instances no longer
+    # referenced by the current global metadata (e.g. after Teams recreated
+    # its internal databases on re-login/cache reset), by classifying raw
+    # records based on the shape of their decoded content instead of relying
+    # on (now-stale) object store metadata.
+    known_keys = getattr(db, 'known_store_keys', set())
+    for record in db.iterate_records_content_based(known_keys):
+        extracted_values.append(record)
+
     return extracted_values
 
 
